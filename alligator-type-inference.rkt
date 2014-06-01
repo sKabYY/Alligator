@@ -4,13 +4,24 @@
 ;            | Number
 ;            | Boolean
 ;            | (lambda (Variable*) Expression)
-;            | (letrec ((Variable (Variable)* Expression)*) Expression)
+;            | (if Expression Expression Expression)
+;            | (let ((Variable Expression)*) Expression)
+;            | (letrec ((Variable (Variable*) Expression)*) Expression)
 ;            | (begin Expression*)
 ;            | (set! Variable Expression)
-;            | (letcc Variable Expression)
-;            | (raise Expression)
-;            | (catch Expression with Variable Expression)
 ;            | (Expression Expression*)
+;
+; Type = SimpleType | UnionType
+; TypeOrVar = Type | Variable
+; SimpleType =
+;            | Any
+;            | Num
+;            | Bool
+;            | (-> Type Type)  ; procedure type
+;            | Opd
+;            | Void
+;            | (* Type Type) ; pair
+; UnionType: a set of SimpleType
 ;
 ; Value = Number
 ;       | Boolean
@@ -18,16 +29,15 @@
 ;       | Opd
 ;       | <void>
 ;       | Mutpair
-;       | Continuation
 ;
 ; Closure: (Variable*) * Expression * Environment
 ; Mutpair: Reference * Reference
 ;
 ; Opd:
-;  ifv: Boolean * T * T -> T
 ;  +: Number * Number * ... -> Number
 ;  -: Number * Number * ...-> Number
 ;  *: Number * Number * ...-> Number
+;  void: -> <void>
 ;  remainder: Number * Number * ...-> Number
 ;  zero?: Number -> Boolean
 ;  print: Value -> <void>
@@ -38,18 +48,6 @@
 ;  setleft!: Mutpair * Value -> <void>
 ;  setright!: Mutpair * Value -> <void>
 ;
-; (if L M N)
-; = ((ifv L (lambda () M) (lambda () N)))
-;
-; (let ((X1 N1)...(Xn Nn)) M)
-; = ((lambda (X1...Xn) M) N1...Nn)
-;
-; (fix Xf (X1...Xn) M)
-; = (letrec ((X1 (lambda (X1...Xn) M))) X1)
-;
-; (cc M N)
-; = (M N)
-;
 ; Environment: Variable -> Reference
 ; Store: Reference -> Value
 
@@ -57,55 +55,14 @@
 (define the-max-store-size 32)
 (define (interp exp1)
   (initialize-store! the-max-store-size)
-  (value-of/k (macro-translate exp1) (init-env) (end-cont)))
+  (reset-space-cost!)
+  (value-of/k exp1 (init-env) (end-cont)))
 
-(define dec-var car)
-(define dec-args cadr)
-(define dec-body caddr)
-
-(define (macro-translate exp1)
-  (define (>> exp1) (macro-translate exp1))
-  (match exp1
-    ; a variable
-    [(? symbol? s) s]
-    ; a number
-    [(? number? n) n]
-    ; a boolean
-    [(? boolean? b) b]
-    ; a procedure
-    [`(lambda ,a ,b) `(lambda ,a ,(>> b))]
-    ; a letrec expression
-    [`(letrec ,decs ,body)
-     `(letrec ,(map (lambda (dec)
-                      (list (dec-var dec) (dec-args dec) (>> (dec-body dec))))
-                    decs)
-        ,(>> body))]
-    ; a begin expression
-    [`(begin . ,exps) `(begin . ,(map >> exps))]
-    ; a set expression
-    [`(set! ,v ,e) `(set! ,v ,(>> e))]
-    ; a letcc expression
-    [`(letcc ,v ,e) `(letcc ,v ,(>> e))]
-    ; a raise expression
-    [`(raise ,e) `(raise ,(>> e))]
-    ; a catch expression
-    [`(catch ,body with ,var ,p-body)
-     `(catch ,(>> body) with ,var ,(>> p-body))]
-    ; a if expression
-    [`(if ,e1 ,e2 ,e3)
-     `((ifv ,(>> e1) (lambda () ,(>> e2)) (lambda () ,(>> e3))))]
-    ; a let expression
-    [`(let ,decs ,body)
-     (let ((vars (map car decs))
-           (exps (map cadr decs)))
-       `((lambda ,vars ,(>> body)) . ,(map >> exps)))]
-    ; a recursive procedure
-    [`(fix ,f ,as ,b)
-     `(letrec ((,f ,as ,(>> b))) ,f)]
-    ; a cc epxression
-    [`(cc ,e1 ,e2) `(,(>> e1) ,(>> e2))]
-    ; an application
-    [`(,ef . ,exps) `(,(>> ef) . ,(map >> exps))]))
+(define (dec-var dec) (car dec))
+(define (dec-exp dec) (cadr dec))
+(define (rec-dec-var dec) (car dec))
+(define (rec-dec-args dec) (cadr dec))
+(define (rec-dec-body dec) (caddr dec))
 
 (define (value-of/k exp1 env cont)
   (gc (void) env cont)
@@ -118,29 +75,30 @@
     [(? boolean? b) (apply-cont cont b)]
     ; a procedure
     [`(lambda ,args ,body) (apply-cont cont (closure args body env))]
+    ; an if expression
+    [`(if ,e1 ,e2 ,e3)
+     (value-of/k e1 env (if-cont cont env e2 e3))]
+    ; a let expression
+    [`(let ,decs ,body)
+     (value-of/k `((lambda ,(map dec-var decs) ,body)
+                   ,@(map dec-exp decs))
+                 env
+                 cont)]
     ; a letrec expression
-    [`(letrec ,decs ,body)
-     (let ((vars (map dec-var decs))
-           (argss (map dec-args decs))
-           (bodies (map dec-body decs)))
+    [`(letrec ,rec-decs ,body)
+     (let ((vars (map rec-dec-var rec-decs))
+           (argss (map rec-dec-args rec-decs))
+           (bodies (map rec-dec-body rec-decs)))
        (value-of/k body (extend-env-letrec env vars argss bodies) cont))]
     ; a begin expression
     [`(begin . ,exps)
-     (if (null? exps)
-         (apply-cont cont (void))
-         (apply-cont (begin-cont cont env exps) (void)))]
+     (cond
+      [(null? exps) (apply-cont cont (void))]
+      [(null? (cdr exps)) (value-of/k (car exps) env cont)]
+      [else (value-of/k (car exps) env (begin-cont cont env (cdr exps)))])]
     ; a set expression
     [`(set! ,v ,e)
      (value-of/k e env (set-cont cont env v))]
-    ; a letcc expression
-    [`(letcc ,v ,e)
-     (value-of/k e (extend-env-let env (list v) (list (contval cont))) cont)]
-    ; a raise expression
-    [`(raise ,e)
-     (value-of/k e env (raise-cont cont))]
-    ; a catch expression
-    [`(catch ,body with ,var ,p-body)
-     (value-of/k body env (catch-cont cont env var p-body))]
     ; an application
     [`(,ef . ,exps)
      (value-of/k ef env (args-cont cont env exps))]))
@@ -220,8 +178,17 @@
 (define (setref! ref val)
   (vector-set! the-store (reference-n ref) val))
 
+(define the-space-cost 0)
+(define (reset-space-cost!)
+  (set! the-space-cost 0))
+(define (update-space-cost!)
+  (let ((cost (- the-store-offset
+                 the-num-opds
+                 (length the-store-free-list))))
+    (set! the-space-cost (max the-space-cost cost))))
+
 (define (store-info)
-  (let* ((start (length opd-table))
+  (let* ((start the-num-opds)
          (size (- the-store-offset start))
          (vec (make-vector size)))
     (define (iter i)
@@ -236,8 +203,7 @@
 ; continuation
 (define (print-info info)
   (displayln info)
-  (display "Store: ")
-  (pretty-print (store-info)))
+  (printf "#SpaceCost=~a~%" the-space-cost))
 
 (define (end-cont)
   (lambda (msg)
@@ -256,6 +222,15 @@
       ('get-prev cont)
       ('get-env env)
       ('apply app-func))))
+
+(define (if-cont cont env then-exp else-exp)
+  (cont-with-env
+   cont
+   env
+   (lambda (v)
+     (if v
+         (value-of/k then-exp env cont)
+         (value-of/k else-exp env cont)))))
 
 (define (begin-cont cont env exps)
   ; assert (not (null? exps))
@@ -353,8 +328,6 @@
 (struct operation (name opd) #:transparent)
 (struct mutpair (left-ref right-ref) #:transparent)
 
-(define (-ifv b v1 v2) (if (true? b) v1 v2))
-
 (define (-pair vl vr) (mutpair (newref vl) (newref vr)))
 (define (-left pair) (deref (mutpair-left-ref pair)))
 (define (-right pair) (deref (mutpair-right-ref pair)))
@@ -375,10 +348,10 @@
   (map (lambda (p)
          (cons (car p) (operation (car p) (cdr p))))
        (list
-        (cons 'ifv -ifv)
         (cons '+ +)
         (cons '* *)
         (cons '- -)
+        (cons 'void void)
         (cons 'remainder remainder)
         (cons 'zero? zero?)
         (cons 'pair -pair)
@@ -388,6 +361,7 @@
         (cons 'setleft! -setleft!)
         (cons 'setright! -setright!)
         (cons 'print -print))))
+(define the-num-opds (length opd-table))
 
 (define (init-env)
   (extend-env-let (empty-env) (map car opd-table) (map cdr opd-table)))
@@ -410,6 +384,7 @@
 
 ; gc
 (define (gc val env cont)
+  (update-space-cost!)
   (define flags (make-vector the-store-offset 'white))
   (define grays '())
   (define (mark-ref ref)
@@ -486,4 +461,4 @@
 
 ; test
 (require "test-cases.rkt")
-(test interp alligator-cases)
+(test interp alligator-ti-cases)
